@@ -15,10 +15,13 @@ jobs:
           java-version: '17'
       - uses: gradle/actions/setup-gradle@v5
         with:
-          gradle-version: '8.7'
+          gradle-version: '8.14.3'
       - name: Build release APK
-        run: gradle assembleRelease --no-daemon
+        run: gradle assembleRelease --no-daemon --stacktrace
+      - name: Show engine version
+        run: gradle -q :app:dependencies --configuration releaseRuntimeClasspath | grep -m1 geckoview || true
       - uses: actions/upload-artifact@v6
         with:
           name: WatchBrowser-apk
           path: app/build/outputs/apk/release/*.apk
+          compression-level: 0

@@ -5,91 +5,116 @@ import android.app.AlertDialog;
 import android.content.ComponentCallbacks2;
 import android.content.Context;
 import android.content.SharedPreferences;
-import android.graphics.Bitmap;
 import android.graphics.Color;
+import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.text.SpannableStringBuilder;
+import android.text.Spanned;
+import android.text.method.LinkMovementMethod;
+import android.text.style.RelativeSizeSpan;
+import android.text.style.StyleSpan;
 import android.view.Gravity;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
-import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
-import android.webkit.CookieManager;
-import android.webkit.WebChromeClient;
-import android.webkit.WebResourceRequest;
-import android.webkit.WebSettings;
-import android.webkit.WebView;
-import android.webkit.WebViewClient;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
+import android.widget.ScrollView;
 import android.widget.TextView;
 
+import java.util.ArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
 /**
- * Minimal browser for round Wear OS watches.
- * - One WebView, no AndroidX, no libraries (APK ~30 KB).
- * - Rotating bezel / crown scrolls the page.
- * - Data-saver toggles: images, JavaScript, reader mode, round padding.
- * - Pauses all timers when off-screen to save battery.
+ * Minimal browser for round Wear OS watches (Galaxy Watch 4 Classic).
+ *
+ * Two engines:
+ *  - TEXT (default): fetches pages itself and shows text + links. Tiny RAM/CPU, no WebView needed.
+ *  - FULL: Mozilla GeckoView, created only on demand, for pages that need JavaScript.
  */
 public class MainActivity extends Activity {
 
     private static final String HOME = "https://html.duckduckgo.com/html/";
     private static final String SEARCH = "https://html.duckduckgo.com/html/?q=";
 
-    private WebView web;
-    private View overlay;
-    private EditText urlBox;
-    private ProgressBar progress;
-    private TextView toggleImg, toggleJs, toggleRound;
+    private static final class Entry {
+        final String url;
+        int scrollY;
+        Entry(String u) { url = u; }
+    }
+
     private SharedPreferences prefs;
+    private final Handler ui = new Handler(Looper.getMainLooper());
+    private final ExecutorService net = Executors.newSingleThreadExecutor();
     private float scrollFactor;
 
-    private boolean images, js, round;
+    private FrameLayout content;
+    private ScrollView textScroll;
+    private TextView textView;
+    private GeckoMode gecko;
+    private ProgressBar progress;
+    private View overlay;
+    private EditText urlBox;
+    private TextView modeBtn, jsBtn;
+
+    private boolean full, js;
+    private int loadGen;
+
+    // Text-mode history
+    private final ArrayList<Entry> back = new ArrayList<>();
+    private final ArrayList<Entry> fwd = new ArrayList<>();
+    private Entry current;
 
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
         prefs = getSharedPreferences("p", MODE_PRIVATE);
-        images = prefs.getBoolean("img", false);   // images OFF by default: biggest saver
         js = prefs.getBoolean("js", true);
-        round = prefs.getBoolean("round", true);
+        full = prefs.getBoolean("full", false);
         scrollFactor = ViewConfiguration.get(this).getScaledVerticalScrollFactor();
 
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
 
-        try {
-            web = new WebView(this);
-        } catch (Throwable t) {
-            TextView err = new TextView(this);
-            err.setText("No WebView on this watch.\nInstall/enable Android System WebView.");
-            err.setGravity(Gravity.CENTER);
-            err.setTextColor(Color.WHITE);
-            err.setPadding(40, 40, 40, 40);
-            root.addView(err);
-            setContentView(root);
-            return;
-        }
+        content = new FrameLayout(this);
+        root.addView(content, new FrameLayout.LayoutParams(-1, -1));
 
-        setupWebView();
-        root.addView(web, new FrameLayout.LayoutParams(-1, -1));
+        // --- Text mode view: round-screen padding so nothing is clipped by the circle ---
+        int w = getResources().getDisplayMetrics().widthPixels;
+        textView = new TextView(this);
+        textView.setTextColor(0xFFE0E0E0);
+        textView.setLinkTextColor(0xFF8AB4F8);
+        textView.setTextSize(14);
+        textView.setLineSpacing(0, 1.15f);
+        textView.setPadding(w * 11 / 100, w * 16 / 100, w * 11 / 100, w * 30 / 100);
+        textView.setMovementMethod(LinkMovementMethod.getInstance());
+        textView.setHighlightColor(0x408AB4F8);
+        textScroll = new ScrollView(this);
+        textScroll.setVerticalScrollBarEnabled(false);
+        textScroll.setFocusable(true);
+        textScroll.setFocusableInTouchMode(true);
+        textScroll.addView(textView, new FrameLayout.LayoutParams(-1, -2));
 
         progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         progress.setMax(100);
-        FrameLayout.LayoutParams pl = new FrameLayout.LayoutParams(dp(80), dp(3), Gravity.TOP | Gravity.CENTER_HORIZONTAL);
-        pl.topMargin = dp(6);
+        progress.setVisibility(View.GONE);
+        FrameLayout.LayoutParams pl = new FrameLayout.LayoutParams(dp(80), dp(4), Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+        pl.topMargin = dp(8);
         root.addView(progress, pl);
 
-        // Small floating menu button at the bottom (in the safe area of the circle)
         TextView menuBtn = pill("☰", 0xCC333333);
         menuBtn.setOnClickListener(v -> showOverlay(true));
-        FrameLayout.LayoutParams ml = new FrameLayout.LayoutParams(dp(36), dp(24), Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+        FrameLayout.LayoutParams ml = new FrameLayout.LayoutParams(dp(40), dp(26), Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
         ml.bottomMargin = dp(6);
         root.addView(menuBtn, ml);
 
@@ -100,99 +125,163 @@ public class MainActivity extends Activity {
         setContentView(root);
 
         String start = prefs.getString("last", HOME);
-        if (b != null) web.restoreState(b); else web.loadUrl(start);
+        if (full) switchToFull(start); else switchToText(start);
     }
 
-    private void setupWebView() {
-        WebSettings s = web.getSettings();
-        s.setJavaScriptEnabled(js);
-        s.setLoadsImagesAutomatically(images);
-        s.setBlockNetworkImage(!images);
-        s.setDomStorageEnabled(true);
-        s.setUseWideViewPort(true);
-        s.setLoadWithOverviewMode(true);
-        s.setSupportZoom(true);
-        s.setBuiltInZoomControls(true);
-        s.setDisplayZoomControls(false);
-        s.setTextZoom(90);
-        s.setMediaPlaybackRequiresUserGesture(true);
-        s.setGeolocationEnabled(false);
-        s.setSaveFormData(false);
-        s.setSupportMultipleWindows(false);
-        s.setAllowFileAccess(false);
-        s.setCacheMode(WebSettings.LOAD_DEFAULT);
-        // Ask sites for their mobile version
-        s.setUserAgentString(s.getUserAgentString().replace("; wv", ""));
+    // ================= Mode switching =================
 
-        CookieManager.getInstance().setAcceptThirdPartyCookies(web, false);
+    private void switchToText(String url) {
+        full = false;
+        prefs.edit().putBoolean("full", false).apply();
+        if (gecko != null) {             // free the heavy engine's page memory
+            content.removeView(gecko.view);
+            gecko.close();
+            gecko = null;
+        }
+        if (textScroll.getParent() == null) content.addView(textScroll, new FrameLayout.LayoutParams(-1, -1));
+        back.clear();
+        fwd.clear();
+        current = null;
+        navigateText(url, true);
+        refreshLabels();
+    }
 
-        web.setBackgroundColor(Color.WHITE);
-        web.setVerticalScrollBarEnabled(false);
-        web.setHorizontalScrollBarEnabled(false);
-        web.setFocusable(true);
-        web.setFocusableInTouchMode(true);
+    private void switchToFull(String url) {
+        full = true;
+        prefs.edit().putBoolean("full", true).apply();
+        content.removeView(textScroll);
+        try {
+            if (gecko == null) {
+                gecko = new GeckoMode(this, js, new GeckoMode.Listener() {
+                    @Override
+                    public void onProgress(int p) {
+                        progress.setIndeterminate(false);
+                        progress.setProgress(p);
+                        progress.setVisibility(p >= 100 ? View.GONE : View.VISIBLE);
+                    }
 
-        web.setWebViewClient(new WebViewClient() {
-            @Override
-            public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
-                String u = r.getUrl().toString();
-                return !(u.startsWith("http://") || u.startsWith("https://")); // ignore intents, market:// etc.
+                    @Override
+                    public void onUrl(String u) {
+                        prefs.edit().putString("last", u).apply();
+                    }
+                });
+                content.addView(gecko.view, new FrameLayout.LayoutParams(-1, -1));
             }
+            gecko.load(url);
+        } catch (Throwable t) {
+            gecko = null;
+            if (textScroll.getParent() == null) content.addView(textScroll, new FrameLayout.LayoutParams(-1, -1));
+            full = false;
+            prefs.edit().putBoolean("full", false).apply();
+            showText(null, "Full mode failed to start", t.toString());
+        }
+        refreshLabels();
+    }
 
-            @Override
-            public void onPageStarted(WebView v, String url, Bitmap f) {
-                progress.setVisibility(View.VISIBLE);
+    private String currentUrl() {
+        if (full && gecko != null) return gecko.url;
+        return current != null ? current.url : HOME;
+    }
+
+    // ================= Text mode =================
+
+    private void navigateText(String url, boolean pushHistory) {
+        if (pushHistory && current != null) {
+            current.scrollY = textScroll.getScrollY();
+            back.add(current);
+            fwd.clear();
+        }
+        current = new Entry(url);
+        loadText(current, 0);
+    }
+
+    private void loadText(Entry e, int restoreScroll) {
+        final int gen = ++loadGen;
+        progress.setIndeterminate(true);
+        progress.setVisibility(View.VISIBLE);
+        net.execute(() -> {
+            TextEngine.Page p = null;
+            String err = null;
+            try {
+                p = TextEngine.load(e.url, url -> ui.post(() -> navigateText(url, true)));
+            } catch (Throwable t) {
+                err = t.getClass().getSimpleName() + ": " + t.getMessage();
             }
-
-            @Override
-            public void onPageFinished(WebView v, String url) {
+            final TextEngine.Page page = p;
+            final String error = err;
+            ui.post(() -> {
+                if (gen != loadGen || full) return;  // a newer load or mode switch won
                 progress.setVisibility(View.GONE);
-                prefs.edit().putString("last", url).apply();
-                if (round) applyRoundPadding();
-            }
-        });
-        web.setWebChromeClient(new WebChromeClient() {
-            @Override
-            public void onProgressChanged(WebView v, int p) {
-                progress.setProgress(p);
-            }
+                if (page == null) {
+                    showText(null, "Couldn't load page", e.url + "\n\n" + error + "\n\nCheck Wi-Fi/LTE, or try ☰ → Full.");
+                    return;
+                }
+                prefs.edit().putString("last", page.url).apply();
+                showText(page.title, page.title, page.body);
+                textScroll.post(() -> textScroll.scrollTo(0, restoreScroll));
+            });
         });
     }
 
-    /** Pads the page so text isn't cut off by the circular screen edges. */
-    private void applyRoundPadding() {
-        web.evaluateJavascript(
-                "(function(){var s=document.getElementById('__rnd');if(!s){s=document.createElement('style');s.id='__rnd';"
-                        + "s.textContent='html{padding:12vw 9vw 22vw 9vw!important;box-sizing:border-box}"
-                        + "img,video,iframe,table{max-width:100%!important;height:auto}';"
-                        + "(document.head||document.documentElement).appendChild(s);}})()", null);
+    private void showText(String unused, String title, CharSequence body) {
+        SpannableStringBuilder sb = new SpannableStringBuilder();
+        if (title != null && !title.isEmpty()) {
+            sb.append(title);
+            sb.setSpan(new StyleSpan(Typeface.BOLD), 0, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            sb.setSpan(new RelativeSizeSpan(1.1f), 0, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            sb.append("\n\n");
+        }
+        sb.append(body);
+        textView.setText(sb);
+        textScroll.scrollTo(0, 0);
+        textScroll.requestFocus();
     }
 
-    /** Strips the page down to readable text — huge savings on heavy pages. */
-    private static final String READER_JS =
-            "(function(){var m=document.querySelector('article')||document.querySelector('main')||document.body;"
-                    + "var t=document.title;var c=m.cloneNode(true);"
-                    + "c.querySelectorAll('script,style,iframe,video,svg,nav,aside,footer,form,noscript,button').forEach(function(e){e.remove()});"
-                    + "c.querySelectorAll('*').forEach(function(e){e.removeAttribute('style');e.removeAttribute('class')});"
-                    + "document.head.innerHTML='<meta name=viewport content=\"width=device-width,initial-scale=1\">"
-                    + "<style>body{background:#000;color:#ddd;font:16px/1.45 sans-serif;padding:14vw 10vw 25vw}"
-                    + "a{color:#8ab4f8}img{max-width:100%;height:auto}h1{font-size:19px}</style>';"
-                    + "document.body.innerHTML='<h1>'+t+'</h1>'+c.innerHTML;window.scrollTo(0,0);})()";
+    private void goBack() {
+        if (full && gecko != null) { gecko.back(); return; }
+        if (back.isEmpty()) return;
+        current.scrollY = textScroll.getScrollY();
+        fwd.add(current);
+        current = back.remove(back.size() - 1);
+        loadText(current, current.scrollY);
+    }
 
-    // ---------- Rotating bezel / crown ----------
+    private void goForward() {
+        if (full && gecko != null) { gecko.forward(); return; }
+        if (fwd.isEmpty()) return;
+        current.scrollY = textScroll.getScrollY();
+        back.add(current);
+        current = fwd.remove(fwd.size() - 1);
+        loadText(current, current.scrollY);
+    }
+
+    private void reload() {
+        if (full && gecko != null) gecko.reload();
+        else if (current != null) loadText(current, textScroll.getScrollY());
+    }
+
+    private void open(String url) {
+        if (full && gecko != null) gecko.load(url);
+        else navigateText(url, true);
+    }
+
+    // ================= Rotating bezel =================
+
     @Override
     public boolean dispatchGenericMotionEvent(MotionEvent ev) {
-        if (web != null && overlay.getVisibility() != View.VISIBLE
+        if (overlay.getVisibility() != View.VISIBLE
                 && ev.getAction() == MotionEvent.ACTION_SCROLL
                 && ev.isFromSource(InputDevice.SOURCE_ROTARY_ENCODER)) {
-            float delta = -ev.getAxisValue(MotionEvent.AXIS_SCROLL) * scrollFactor * 1.5f;
-            web.scrollBy(0, Math.round(delta));
+            int delta = Math.round(-ev.getAxisValue(MotionEvent.AXIS_SCROLL) * scrollFactor * 1.5f);
+            if (full && gecko != null) gecko.scrollBy(delta);
+            else textScroll.smoothScrollBy(0, delta);
             return true;
         }
         return super.dispatchGenericMotionEvent(ev);
     }
 
-    // ---------- Overlay menu ----------
+    // ================= Menu overlay =================
+
     private View buildOverlay() {
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
@@ -216,46 +305,42 @@ public class MainActivity extends Activity {
         col.addView(urlBox, new LinearLayout.LayoutParams(-1, -2));
 
         col.addView(row(
-                btn("◀", v -> { if (web.canGoBack()) web.goBack(); showOverlay(false); }),
-                btn("⟳", v -> { web.reload(); showOverlay(false); }),
-                btn("▶", v -> { if (web.canGoForward()) web.goForward(); showOverlay(false); })));
+                btn("◀", v -> { goBack(); showOverlay(false); }),
+                btn("⟳", v -> { reload(); showOverlay(false); }),
+                btn("▶", v -> { goForward(); showOverlay(false); })));
 
-        col.addView(row(
-                btn("Home", v -> { web.loadUrl(HOME); showOverlay(false); }),
-                btn("Read", v -> { web.evaluateJavascript(READER_JS, null); showOverlay(false); })));
+        modeBtn = btn("", v -> {
+            String u = currentUrl();
+            showOverlay(false);
+            if (full) switchToText(u); else switchToFull(u);
+        });
+        col.addView(row(btn("Home", v -> { open(HOME); showOverlay(false); }), modeBtn));
 
-        toggleImg = btn("", v -> { images = !images; applyToggles(); web.reload(); });
-        toggleJs = btn("", v -> { js = !js; applyToggles(); web.reload(); });
-        toggleRound = btn("", v -> { round = !round; applyToggles(); web.reload(); });
-        col.addView(row(toggleImg, toggleJs));
-        col.addView(row(toggleRound, btn("Clear", v -> confirmClear())));
-        refreshToggleLabels();
+        jsBtn = btn("", v -> {
+            js = !js;
+            prefs.edit().putBoolean("js", js).apply();
+            if (gecko != null) { gecko.setJs(js); gecko.reload(); }
+            refreshLabels();
+        });
+        col.addView(row(jsBtn, btn("Clear", v -> confirmClear())));
+        refreshLabels();
         return col;
     }
 
-    private void applyToggles() {
-        WebSettings s = web.getSettings();
-        s.setJavaScriptEnabled(js);
-        s.setLoadsImagesAutomatically(images);
-        s.setBlockNetworkImage(!images);
-        prefs.edit().putBoolean("img", images).putBoolean("js", js).putBoolean("round", round).apply();
-        refreshToggleLabels();
-    }
-
-    private void refreshToggleLabels() {
-        toggleImg.setText(images ? "Img ✓" : "Img ✗");
-        toggleJs.setText(js ? "JS ✓" : "JS ✗");
-        toggleRound.setText(round ? "Fit ✓" : "Fit ✗");
+    private void refreshLabels() {
+        if (modeBtn == null) return;
+        modeBtn.setText(full ? "Text" : "Full");
+        jsBtn.setText(js ? "JS ✓" : "JS ✗");
     }
 
     private void confirmClear() {
         new AlertDialog.Builder(this)
-                .setMessage("Clear cache, cookies & history?")
+                .setMessage("Clear history, cookies & cache?")
                 .setPositiveButton("Yes", (d, w) -> {
-                    web.clearCache(true);
-                    web.clearHistory();
-                    CookieManager.getInstance().removeAllCookies(null);
-                    getSharedPreferences("p", MODE_PRIVATE).edit().remove("last").apply();
+                    back.clear();
+                    fwd.clear();
+                    GeckoMode.clearAll();
+                    prefs.edit().remove("last").apply();
                 })
                 .setNegativeButton("No", null)
                 .show();
@@ -264,11 +349,11 @@ public class MainActivity extends Activity {
     private void showOverlay(boolean show) {
         overlay.setVisibility(show ? View.VISIBLE : View.GONE);
         if (show) {
-            urlBox.setText(web.getUrl());
+            urlBox.setText(currentUrl());
         } else {
             ((InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE))
                     .hideSoftInputFromWindow(urlBox.getWindowToken(), 0);
-            web.requestFocus();
+            if (!full) textScroll.requestFocus();
         }
     }
 
@@ -276,14 +361,15 @@ public class MainActivity extends Activity {
         in = in.trim();
         if (in.isEmpty()) return;
         String url;
-        if (in.matches("^https?://.*")) url = in;
+        if (in.matches("(?i)^https?://.*")) url = in;
         else if (!in.contains(" ") && in.contains(".")) url = "https://" + in;
         else url = SEARCH + android.net.Uri.encode(in);
-        web.loadUrl(url);
         showOverlay(false);
+        open(url);
     }
 
-    // ---------- Tiny UI helpers ----------
+    // ================= UI helpers =================
+
     private LinearLayout row(View... views) {
         LinearLayout r = new LinearLayout(this);
         r.setGravity(Gravity.CENTER);
@@ -292,8 +378,6 @@ public class MainActivity extends Activity {
             lp.setMargins(dp(3), dp(3), dp(3), dp(3));
             r.addView(v, lp);
         }
-        LinearLayout.LayoutParams rl = new LinearLayout.LayoutParams(-1, -2);
-        r.setLayoutParams(rl);
         return r;
     }
 
@@ -320,12 +404,14 @@ public class MainActivity extends Activity {
         return Math.round(v * getResources().getDisplayMetrics().density);
     }
 
-    // ---------- Lifecycle: save battery & RAM ----------
+    // ================= Lifecycle: save battery & RAM =================
+
     @Override
     public boolean onKeyDown(int code, KeyEvent e) {
         if (code == KeyEvent.KEYCODE_BACK) {
-            if (overlay != null && overlay.getVisibility() == View.VISIBLE) { showOverlay(false); return true; }
-            if (web != null && web.canGoBack()) { web.goBack(); return true; }
+            if (overlay.getVisibility() == View.VISIBLE) { showOverlay(false); return true; }
+            if (full && gecko != null && gecko.canBack) { gecko.back(); return true; }
+            if (!full && !back.isEmpty()) { goBack(); return true; }
         }
         return super.onKeyDown(code, e);
     }
@@ -333,34 +419,42 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
-        if (web != null) { web.onPause(); web.pauseTimers(); }
+        if (gecko != null) gecko.setActive(false);
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        if (web != null) { web.onResume(); web.resumeTimers(); }
-    }
-
-    @Override
-    protected void onSaveInstanceState(Bundle out) {
-        super.onSaveInstanceState(out);
-        if (web != null) web.saveState(out);
+        if (gecko != null) gecko.setActive(true);
     }
 
     @Override
     public void onTrimMemory(int level) {
         super.onTrimMemory(level);
-        if (web != null && level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) web.clearCache(false);
+        // Under memory pressure in the background, drop the heavy engine entirely.
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND && gecko != null && full) {
+            content.removeView(gecko.view);
+            gecko.close();
+            gecko = null;
+            pendingFullReload = true;
+        }
+    }
+
+    private boolean pendingFullReload;
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        if (pendingFullReload) {
+            pendingFullReload = false;
+            switchToFull(prefs.getString("last", HOME));
+        }
     }
 
     @Override
     protected void onDestroy() {
-        if (web != null) {
-            web.stopLoading();
-            web.destroy();
-            web = null;
-        }
+        net.shutdownNow();
+        if (gecko != null) gecko.close();
         super.onDestroy();
     }
 }
