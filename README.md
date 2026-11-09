@@ -1,24 +1,25 @@
 # WatchBrowser — tiny browser for Galaxy Watch 4 Classic
 
-Plain Java + the system WebView. No AndroidX, no Kotlin, no libraries → APK around 30 KB,
-and it adds only a few MB of RAM on top of the WebView itself.
+Wear OS on the Galaxy Watch 4 has **no Android System WebView**, so this app brings its own engines:
 
-## Features
-- **Bezel scrolling** – rotate the bezel to scroll pages.
-- **Round-screen fit** – pads pages so text isn't clipped by the circle (toggle "Fit").
-- **Images off by default** – the biggest RAM/data/battery saver (toggle "Img").
-- **JavaScript toggle** – turn off for static sites to cut CPU use (toggle "JS").
-- **Reader mode** – "Read" strips a page to text on a black background (OLED-friendly).
-- **Lite search** – DuckDuckGo HTML version as home page.
-- Pauses all page timers when the screen goes off; drops cache when memory runs low.
-- Back button / swipe-back goes back in history.
+- **Text mode (default)** – the app downloads the page itself and shows the text with clickable links.
+  No WebView, no JavaScript, no images: a few MB of RAM and almost no battery.
+- **Full mode** – Mozilla's GeckoView (Firefox engine) for pages that need JavaScript. It is only
+  started when you switch to Full, with ad/tracker blocking on, and is shut down when you switch back.
 
-Tap the small ☰ button at the bottom for the menu; tap the dark area to close it.
+## Using it
+- Tap the small **☰** button at the bottom for the menu; tap the dark area to close it.
+- **Full / Text** switches engines for the current page.
+- **JS** turns JavaScript on/off in Full mode. **Clear** wipes history, cookies and cache.
+- **Rotate the bezel** to scroll. Swipe right / back button goes back.
+- Home and search use DuckDuckGo's lightweight HTML page.
 
 ## Build the APK (no install needed: GitHub Actions)
 1. Create a new GitHub repo and upload this whole folder (including `.github`).
 2. Open the **Actions** tab → "Build APK" runs automatically (or press *Run workflow*).
-3. When it finishes, download **WatchBrowser-apk** from the run page and unzip it.
+3. When it finishes, download **WatchBrowser-apk** from the run page and unzip it. It contains
+   `app-armeabi-v7a-release.apk` (32-bit) and `app-arm64-v8a-release.apk` (64-bit).
+   Check which your watch needs with `adb shell getprop ro.product.cpu.abi`.
 
 Or with Android Studio: *File → Open* this folder, then *Build → Build APK(s)*.
 
@@ -30,10 +31,9 @@ Or with Android Studio: *File → Open* this folder, then *Build → Build APK(s
    ```
    adb pair <ip>:<pair-port>        # enter the code
    adb connect <ip>:<port>          # port shown on the main Wireless debugging screen
-   adb install app-release.apk
+   adb install app-armeabi-v7a-release.apk   # or the arm64 one
    ```
    (Watch and computer must be on the same Wi-Fi.)
 
 ## Notes
-- Needs a system WebView on the watch. If it's missing, the app shows a message instead of crashing.
 - Change the home page/search engine at the top of `MainActivity.java`.
