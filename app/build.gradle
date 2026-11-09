@@ -33,6 +33,10 @@ android {
         }
     }
 
+    packaging {
+        jniLibs { useLegacyPackaging = true }   // compress the engine's native code
+    }
+
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
@@ -41,5 +45,5 @@ android {
 
 dependencies {
     // Full-mode engine (Mozilla GeckoView, release channel). Only loaded when "Full" is used.
-    implementation 'org.mozilla.geckoview:geckoview:+'
+    implementation 'org.mozilla.geckoview:geckoview:159.0.20261102144711'
 }
